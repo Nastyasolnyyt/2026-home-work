@@ -4,28 +4,22 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Collection;
+import java.util.Comparator;
+import java.util.List;
 
 public final class SolnRendezvousHashRouter {
-
     private final Collection<String> endpoints;
 
     public SolnRendezvousHashRouter(Collection<String> endpoints) {
         this.endpoints = endpoints;
     }
 
-    public String getNode(String key) {
-        String bestNode = null;
-        int maxHash = Integer.MIN_VALUE;
-
-        for (String node : endpoints) {
-            // Вес ноды — это хэш от комбинации ключа и URL ноды
-            int currentHash = hash(key + node);
-            if (currentHash > maxHash) {
-                maxHash = currentHash;
-                bestNode = node;
-            }
-        }
-        return bestNode;
+    // Возвращает n приоритетных узлов для ключа
+    public List<String> getNodes(String key, int n) {
+        return endpoints.stream()
+                .sorted(Comparator.comparingInt((String node) -> hash(key + node)).reversed())
+                .limit(n)
+                .toList();
     }
 
     private static int hash(String input) {

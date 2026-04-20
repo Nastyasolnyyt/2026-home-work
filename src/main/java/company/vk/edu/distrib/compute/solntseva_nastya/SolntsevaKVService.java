@@ -12,8 +12,12 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -26,30 +30,32 @@ public class SolntsevaKVService implements KVService {
     private static final int STATUS_BAD_REQUEST = 400;
     private static final int STATUS_NOT_FOUND = 404;
     private static final int STATUS_NOT_ALLOWED = 405;
+    private static final int STATUS_GATEWAY_TIMEOUT = 504;
     private static final int NO_BODY = -1;
-
-    private static final String ID_PARAM = "id";
-    private static final String METHOD_GET = "GET";
-    private static final String METHOD_PUT = "PUT";
-    private static final String METHOD_DELETE = "DELETE";
 
     private final HttpServer server;
     private final Dao<byte[]> dao;
     private final String myUrl;
+    private final Set<String> topology;
     private final HttpClient httpClient;
     private final SolnHashiStrategy strategy;
-    
     private final SolnConsistentHashRouter consistentRouter;
     private final SolnRendezvousHashRouter rendezvousRouter;
+
+    private record Response(
+            int status,
+            byte[] body
+    ) {
+    }
 
     public SolntsevaKVService(final int port, final Dao<byte[]> dao,
                               final Set<String> topology, final String myUrl,
                               final SolnHashiStrategy strategy) throws IOException {
         this.dao = dao;
         this.myUrl = myUrl;
+        this.topology = topology;
         this.strategy = strategy;
 
-        // Инициализируем роутеры локально, используя переданную topology
         if (strategy == SolnHashiStrategy.CONSISTENT) {
             this.consistentRouter = new SolnConsistentHashRouter(topology);
             this.rendezvousRouter = null;
@@ -59,7 +65,7 @@ public class SolntsevaKVService implements KVService {
         }
 
         this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(2))
+                .connectTimeout(Duration.ofSeconds(1))
                 .build();
 
         this.server = HttpServer.create(new InetSocketAddress(port), 0);
@@ -77,122 +83,148 @@ public class SolntsevaKVService implements KVService {
         server.stop(0);
         try {
             dao.close();
-        } catch (final IOException e) {
+        } catch (IOException e) {
             log.error("Close error", e);
         }
     }
 
-    private void handleStatus(final HttpExchange exchange) throws IOException {
+    private void handleStatus(HttpExchange exchange) throws IOException {
         try (exchange) {
-            final String method = exchange.getRequestMethod();
-            if (METHOD_GET.equals(method)) {
-                exchange.sendResponseHeaders(STATUS_OK, NO_BODY);
+            int status = "GET".equals(exchange.getRequestMethod()) ? STATUS_OK : STATUS_NOT_ALLOWED;
+            exchange.sendResponseHeaders(status, NO_BODY);
+        }
+    }
+
+    private void handleEntity(HttpExchange exchange) {
+        final String query = exchange.getRequestURI().getQuery();
+        final String id = extractParam(query, "id");
+        if (id == null || id.isEmpty()) {
+            sendResponse(exchange, STATUS_BAD_REQUEST, null);
+            return;
+        }
+
+        int n = extractInt(query, "from", topology.size());
+        int ack = extractInt(query, "ack", 1);
+
+        if (ack > n || ack <= 0) {
+            sendResponse(exchange, STATUS_BAD_REQUEST, null);
+            return;
+        }
+
+        List<String> targetNodes = getTargetNodes(id, n);
+        byte[] requestBody = getRequestBody(exchange);
+        String method = exchange.getRequestMethod();
+
+        List<CompletableFuture<Response>> futures = new ArrayList<>();
+        for (String node : targetNodes) {
+            if (myUrl.equals(node)) {
+                futures.add(CompletableFuture.supplyAsync(() -> handleLocalInternal(id, method, requestBody)));
             } else {
-                exchange.sendResponseHeaders(STATUS_NOT_ALLOWED, NO_BODY);
+                futures.add(proxyAsync(node, exchange, method, requestBody));
             }
         }
+
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                .whenComplete((v, e) -> {
+                    List<Response> responses = futures.stream()
+                            .map(f -> f.getNow(new Response(500, null)))
+                            .filter(r -> isSuccessful(r.status, method))
+                            .toList();
+
+                    if (responses.size() >= ack) {
+                        Response best = responses.stream()
+                                .filter(r -> r.status == STATUS_OK || r.status == STATUS_CREATED
+                                        || r.status == STATUS_ACCEPTED)
+                                .findFirst()
+                                .orElse(responses.get(0));
+                        sendResponse(exchange, best.status, best.body);
+                    } else {
+                        sendResponse(exchange, STATUS_GATEWAY_TIMEOUT, null);
+                    }
+                });
     }
 
-    private void handleEntity(final HttpExchange exchange) {
-        try (exchange) {
-            final String query = exchange.getRequestURI().getQuery();
-            final String id = extractId(query);
-
-            if (id == null || id.isEmpty()) {
-                exchange.sendResponseHeaders(STATUS_BAD_REQUEST, NO_BODY);
-                return;
-            }
-
-            final String responsibleNode = getResponsibleNode(id);
-            if (!myUrl.equals(responsibleNode)) {
-                proxyRequest(exchange, responsibleNode);
-                return;
-            }
-
-            handleLocal(exchange, id);
-        } catch (final IOException e) {
-            log.error("Entity handle error", e);
-        }
-    }
-
-    private void handleLocal(final HttpExchange exchange, final String id) throws IOException {
-        final String method = exchange.getRequestMethod();
-        switch (method) {
-            case METHOD_GET -> handleGet(exchange, id);
-            case METHOD_PUT -> handlePut(exchange, id);
-            case METHOD_DELETE -> handleDelete(exchange, id);
-            default -> exchange.sendResponseHeaders(STATUS_NOT_ALLOWED, NO_BODY);
-        }
-    }
-
-    private String getResponsibleNode(final String id) {
-        return switch (strategy) {
-            case CONSISTENT -> consistentRouter.getNode(id);
-            case RENDEZVOUS -> rendezvousRouter.getNode(id);
-        };
-    }
-
-    private void proxyRequest(final HttpExchange exchange, final String targetUrl) throws IOException {
+    private Response handleLocalInternal(String id, String method, byte[] body) {
         try {
-            final URI uri = URI.create(targetUrl + exchange.getRequestURI().toString());
-            final HttpRequest.Builder rb = HttpRequest.newBuilder(uri);
-            final String method = exchange.getRequestMethod();
-            
-            final byte[] body;
-            if (METHOD_PUT.equals(method)) {
-                body = exchange.getRequestBody().readAllBytes();
-            } else {
-                body = new byte[0];
-            }
-            
-            final HttpRequest request = rb.method(method,
-                    HttpRequest.BodyPublishers.ofByteArray(body)).build();
-            final HttpResponse<byte[]> resp = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
-            final byte[] respBody = resp.body();
-            
-            exchange.sendResponseHeaders(resp.statusCode(), respBody.length == 0 ? NO_BODY : respBody.length);
-            if (respBody.length > 0) {
+            return switch (method) {
+                case "GET" -> new Response(STATUS_OK, dao.get(id));
+                case "PUT" -> {
+                    dao.upsert(id, body);
+                    yield new Response(STATUS_CREATED, null);
+                }
+                case "DELETE" -> {
+                    dao.delete(id);
+                    yield new Response(STATUS_ACCEPTED, null);
+                }
+                default -> new Response(STATUS_NOT_ALLOWED, null);
+            };
+        } catch (NoSuchElementException e) {
+            return new Response(STATUS_NOT_FOUND, null);
+        } catch (Exception e) {
+            return new Response(500, null);
+        }
+    }
+
+    private CompletableFuture<Response> proxyAsync(String node, HttpExchange exchange, String method, byte[] body) {
+        URI uri = URI.create(node + exchange.getRequestURI().toString());
+        HttpRequest request = HttpRequest.newBuilder(uri)
+                .method(method, HttpRequest.BodyPublishers.ofByteArray(body))
+                .timeout(Duration.ofMillis(500))
+                .build();
+
+        return httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofByteArray())
+                .thenApply(r -> new Response(r.statusCode(), r.body()))
+                .exceptionally(e -> new Response(500, null));
+    }
+
+    private boolean isSuccessful(int status, String method) {
+        if ("GET".equals(method)) {
+            return status == STATUS_OK || status == STATUS_NOT_FOUND;
+        }
+        return status == STATUS_CREATED || status == STATUS_ACCEPTED;
+    }
+
+    private List<String> getTargetNodes(String id, int n) {
+        if (strategy == SolnHashiStrategy.CONSISTENT) {
+            return consistentRouter.getNodes(id, n);
+        }
+        return rendezvousRouter.getNodes(id, n);
+    }
+
+    private void sendResponse(HttpExchange exchange, int status, byte[] body) {
+        try (exchange) {
+            int length = (body == null || body.length == 0) ? NO_BODY : body.length;
+            exchange.sendResponseHeaders(status, length);
+            if (body != null && body.length > 0) {
                 try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(respBody);
+                    os.write(body);
                 }
             }
-        } catch (final InterruptedException e) {
-            Thread.currentThread().interrupt();
+        } catch (IOException e) {
+            log.error("Response error", e);
         }
     }
 
-    private void handleGet(final HttpExchange exchange, final String id) throws IOException {
+    private byte[] getRequestBody(HttpExchange exchange) {
         try {
-            final byte[] value = dao.get(id);
-            exchange.sendResponseHeaders(STATUS_OK, value.length);
-            try (OutputStream os = exchange.getResponseBody()) {
-                os.write(value);
-            }
-        } catch (final NoSuchElementException e) {
-            exchange.sendResponseHeaders(STATUS_NOT_FOUND, NO_BODY);
+            return exchange.getRequestBody().readAllBytes();
+        } catch (IOException e) {
+            return new byte[0];
         }
     }
 
-    private void handlePut(final HttpExchange exchange, final String id) throws IOException {
-        dao.upsert(id, exchange.getRequestBody().readAllBytes());
-        exchange.sendResponseHeaders(STATUS_CREATED, NO_BODY);
-    }
-
-    private void handleDelete(final HttpExchange exchange, final String id) throws IOException {
-        dao.delete(id);
-        exchange.sendResponseHeaders(STATUS_ACCEPTED, NO_BODY);
-    }
-
-    private static String extractId(final String query) {
+    private String extractParam(String query, String name) {
         if (query == null) {
             return null;
         }
-        for (final String param : query.split("&")) {
-            final String[] kv = param.split("=", 2);
-            if (kv.length == 2 && ID_PARAM.equals(kv[0])) {
-                return kv[1];
-            }
-        }
-        return null;
+        return Arrays.stream(query.split("&"))
+                .map(s -> s.split("=", 2))
+                .filter(a -> a.length == 2 && a[0].equals(name))
+                .map(a -> a[1]).findFirst().orElse(null);
+    }
+
+    private int extractInt(String query, String name, int def) {
+        String val = extractParam(query, name);
+        return val == null ? def : Integer.parseInt(val);
     }
 }
